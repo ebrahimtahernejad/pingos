@@ -33,6 +33,8 @@
 #   PINGOS_TARGET=10.0.0.1:80     # client-only
 #   PINGOS_NONINTERACTIVE=1       # die if any prompt needed
 #   PINGOS_DRY_RUN=1              # show what would happen, don't touch the system
+#   PINGOS_REINSTALL=1            # if already installed, skip menu and reconfigure
+#   PINGOS_UNINSTALL=1            # if already installed, skip menu and uninstall
 
 set -euo pipefail
 
@@ -100,21 +102,38 @@ run() {
         info "[dry-run] $label: $*"
         return 0
     fi
+
+    # Non-TTY: run synchronously, no spinner — keeps logs clean.
+    if [[ ! -t 2 ]]; then
+        if "$@" >/tmp/pingos-install.log 2>&1; then
+            printf '  %s%s%s %s\n' "$C_GREEN" "✓" "$C_RESET" "$label"
+            return 0
+        else
+            printf '  %s%s%s %s\n' "$C_RED" "✗" "$C_RESET" "$label" >&2
+            say
+            say "${C_RED}${C_BOLD}command output:${C_RESET}"
+            sed 's/^/      /' /tmp/pingos-install.log >&2
+            return 1
+        fi
+    fi
+
+    # Interactive: animated spinner.
     local frames='⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏' i=0 pid
     "$@" >/tmp/pingos-install.log 2>&1 &
     pid=$!
-    if [[ -t 1 ]]; then tput civis 2>/dev/null || true; fi
+    tput civis 2>/dev/null || true
     while kill -0 "$pid" 2>/dev/null; do
         local ch="${frames:$((i % ${#frames})):1}"
         printf '\r  %s%s%s %s' "$C_CYAN" "$ch" "$C_RESET" "$label" >&2
         i=$((i+1))
         sleep 0.08 2>/dev/null || true
     done
-    if [[ -t 1 ]]; then tput cnorm 2>/dev/null || true; fi
+    tput cnorm 2>/dev/null || true
+    # \r + clear-line, then write final status.
     if wait "$pid"; then
-        printf '\r  %s%s%s %s\n' "$C_GREEN" "✓" "$C_RESET" "$label"
+        printf '\r\033[2K  %s%s%s %s\n' "$C_GREEN" "✓" "$C_RESET" "$label"
     else
-        printf '\r  %s%s%s %s\n' "$C_RED" "✗" "$C_RESET" "$label" >&2
+        printf '\r\033[2K  %s%s%s %s\n' "$C_RED" "✗" "$C_RESET" "$label" >&2
         say
         say "${C_RED}${C_BOLD}command output:${C_RESET}"
         sed 's/^/      /' /tmp/pingos-install.log >&2
@@ -220,10 +239,7 @@ system_check() {
     ARCH=$(detect_arch)
     ok "arch: $ARCH"
 
-    if [[ -z "${LOCAL_BIN:-}" ]]; then
-        if ! command -v curl >/dev/null 2>&1; then die "missing 'curl' (or pass a local binary as the first arg)"; fi
-        ok "curl present"
-    else
+    if [[ -n "${LOCAL_BIN:-}" ]]; then
         ok "offline mode (will install $LOCAL_BIN)"
     fi
 }
@@ -467,12 +483,18 @@ ExecStart=/usr/local/bin/pingos $ROLE --config /etc/pingos/${ROLE}.toml
 Restart=on-failure
 RestartSec=3
 
-# Hardening (we still run as root for ICMP raw socket).
+# Capabilities. We run as root for the raw ICMP socket, but bound the set
+# tightly so a compromised binary can't acquire anything else.
+#   CAP_NET_RAW           — open SOCK_RAW / SOCK_DGRAM ICMP sockets
+#   CAP_NET_BIND_SERVICE  — bind TCP listeners on privileged ports (<1024)
+AmbientCapabilities=CAP_NET_RAW CAP_NET_BIND_SERVICE
+CapabilityBoundingSet=CAP_NET_RAW CAP_NET_BIND_SERVICE
+
+# Hardening.
 NoNewPrivileges=yes
 PrivateTmp=yes
 ProtectHome=yes
 ProtectSystem=strict
-ReadWritePaths=/var/log
 ProtectKernelTunables=yes
 ProtectKernelModules=yes
 ProtectControlGroups=yes
@@ -480,6 +502,8 @@ ProtectClock=yes
 LockPersonality=yes
 RestrictRealtime=yes
 RestrictSUIDSGID=yes
+RestrictNamespaces=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
 SystemCallArchitectures=native
 
 [Install]
@@ -549,12 +573,177 @@ final_summary() {
     say
 }
 
+# ───────────────────── existing-install detection ─────────────────────────
+
+INSTALLED_BIN=""
+INSTALLED_UNIT=""
+INSTALLED_ROLE=""
+INSTALLED_CONFIG=""
+
+# Returns 0 if pingos is at all present on this box (binary OR unit OR config).
+detect_installation() {
+    INSTALLED_BIN=""
+    INSTALLED_UNIT=""
+    INSTALLED_ROLE=""
+    INSTALLED_CONFIG=""
+
+    [[ -f /usr/local/bin/pingos ]] && INSTALLED_BIN=/usr/local/bin/pingos
+    [[ -f /etc/systemd/system/pingos.service ]] && INSTALLED_UNIT=/etc/systemd/system/pingos.service
+    if [[ -n "$INSTALLED_UNIT" ]]; then
+        INSTALLED_ROLE=$(sed -nE 's@^ExecStart=.*/pingos[[:space:]]+(server|client)([[:space:]]|$).*@\1@p' "$INSTALLED_UNIT" | head -1)
+    fi
+    if [[ -n "$INSTALLED_ROLE" && -f "/etc/pingos/${INSTALLED_ROLE}.toml" ]]; then
+        INSTALLED_CONFIG="/etc/pingos/${INSTALLED_ROLE}.toml"
+    fi
+
+    [[ -n "$INSTALLED_BIN" || -n "$INSTALLED_UNIT" || -n "$INSTALLED_CONFIG" ]]
+}
+
+# Read a TOML basic-string value from the installer-generated config files.
+# Tolerates both quoted and bare values. Single-line basic strings only.
+get_toml_value() {
+    local file="$1" key="$2"
+    [[ -f "$file" ]] || return
+    sed -nE "s/^[[:space:]]*${key}[[:space:]]*=[[:space:]]*\"([^\"]*)\".*/\\1/p; \
+              s/^[[:space:]]*${key}[[:space:]]*=[[:space:]]*([^\"#[:space:]][^#[:space:]]*).*/\\1/p" \
+        "$file" | head -1
+}
+
+existing_install_menu() {
+    section "existing install detected"
+    info "binary:   ${INSTALLED_BIN:-${C_GRAY}<absent>${C_RESET}}"
+    info "unit:     ${INSTALLED_UNIT:-${C_GRAY}<absent>${C_RESET}}"
+    info "config:   ${INSTALLED_CONFIG:-${C_GRAY}<absent>${C_RESET}}"
+    info "role:     ${INSTALLED_ROLE:-${C_GRAY}<unknown>${C_RESET}}"
+    local active="inactive"
+    if systemctl is-active --quiet pingos.service 2>/dev/null; then active="${C_GREEN}active${C_RESET}"; fi
+    info "service:  $active"
+    say
+
+    local pick
+    pick=$(choose "what now?" \
+        "reconfigure  ${C_GRAY}— re-run wizard, replace config + unit (binary stays)${C_RESET}" \
+        "uninstall    ${C_GRAY}— stop + remove pingos completely${C_RESET}" \
+        "cancel       ${C_GRAY}— leave it alone${C_RESET}")
+    case "$pick" in
+        1) ACTION=reconfigure ;;
+        2) ACTION=uninstall ;;
+        3) ACTION=cancel ;;
+    esac
+}
+
+# Populate PINGOS_* defaults from the existing config so the wizard pre-fills
+# with the user's previous answers. CLI/env values still win.
+seed_from_existing_config() {
+    local f="$INSTALLED_CONFIG"
+    [[ -n "$f" && -f "$f" ]] || return
+    info "reading existing settings from $f"
+    : "${PINGOS_ROLE:=$INSTALLED_ROLE}"
+    : "${PINGOS_PASSWORD:=$(get_toml_value "$f" password)}"
+    : "${PINGOS_COMPRESSION:=$(get_toml_value "$f" compression)}"
+    : "${PINGOS_FEC:=$(get_toml_value "$f" fec)}"
+    case "$INSTALLED_ROLE" in
+        server)
+            : "${PINGOS_BIND:=$(get_toml_value "$f" bind)}"
+            ;;
+        client)
+            : "${PINGOS_LISTEN:=$(get_toml_value "$f" listen)}"
+            : "${PINGOS_SERVER:=$(get_toml_value "$f" server)}"
+            : "${PINGOS_TARGET:=$(get_toml_value "$f" target)}"
+            ;;
+    esac
+    export PINGOS_ROLE PINGOS_PASSWORD PINGOS_COMPRESSION PINGOS_FEC \
+           PINGOS_BIND PINGOS_LISTEN PINGOS_SERVER PINGOS_TARGET
+}
+
+uninstall_flow() {
+    section "uninstalling"
+
+    if [[ "${PINGOS_DRY_RUN:-}" != 1 ]] && systemctl is-active --quiet pingos.service 2>/dev/null; then
+        run "stopping pingos.service" systemctl stop pingos.service \
+            || warn "stop failed (continuing)"
+    else
+        info "service not active"
+    fi
+
+    if [[ "${PINGOS_DRY_RUN:-}" != 1 ]] && systemctl is-enabled --quiet pingos.service 2>/dev/null; then
+        run "disabling pingos.service" systemctl disable pingos.service \
+            || warn "disable failed (continuing)"
+    fi
+
+    if [[ -f /etc/systemd/system/pingos.service ]]; then
+        if [[ "${PINGOS_DRY_RUN:-}" == 1 ]]; then
+            info "(dry-run) would remove /etc/systemd/system/pingos.service"
+        else
+            rm -f /etc/systemd/system/pingos.service
+            ok "removed /etc/systemd/system/pingos.service"
+        fi
+    fi
+
+    if [[ "${PINGOS_DRY_RUN:-}" != 1 ]]; then
+        run "systemctl daemon-reload" systemctl daemon-reload \
+            || warn "daemon-reload failed (probably no running systemd — ok)"
+    fi
+
+    if [[ -f /usr/local/bin/pingos ]]; then
+        if [[ "${PINGOS_DRY_RUN:-}" == 1 ]]; then
+            info "(dry-run) would remove /usr/local/bin/pingos"
+        else
+            rm -f /usr/local/bin/pingos
+            ok "removed /usr/local/bin/pingos"
+        fi
+    fi
+
+    if [[ -d /etc/pingos ]]; then
+        if confirm "also remove /etc/pingos/ (contains your TOML configs — secrets!)" "Y"; then
+            if [[ "${PINGOS_DRY_RUN:-}" == 1 ]]; then
+                info "(dry-run) would remove /etc/pingos/"
+            else
+                rm -rf /etc/pingos
+                ok "removed /etc/pingos/"
+            fi
+        else
+            warn "kept /etc/pingos/"
+        fi
+    fi
+
+    say
+    say "${C_GREEN}${C_BOLD}    ╭──────────────────────────────────────────────────────────╮${C_RESET}"
+    say "${C_GREEN}${C_BOLD}    │${C_RESET}                                                          ${C_GREEN}${C_BOLD}│${C_RESET}"
+    say "${C_GREEN}${C_BOLD}    │${C_RESET}   ${C_BOLD}done. pingos cleared out.${C_RESET}                             ${C_GREEN}${C_BOLD}│${C_RESET}"
+    say "${C_GREEN}${C_BOLD}    │${C_RESET}                                                          ${C_GREEN}${C_BOLD}│${C_RESET}"
+    say "${C_GREEN}${C_BOLD}    ╰──────────────────────────────────────────────────────────╯${C_RESET}"
+    say
+}
+
 # ───────────────────── main ────────────────────────────────────────────────
+
+ACTION=""
 
 main() {
     banner
     require_root
     system_check
+
+    if detect_installation; then
+        if [[ "${PINGOS_UNINSTALL:-}" == 1 ]]; then
+            ACTION=uninstall
+        elif [[ "${PINGOS_REINSTALL:-}" == 1 ]]; then
+            ACTION=reconfigure
+        elif [[ "${PINGOS_NONINTERACTIVE:-}" == 1 ]] || ! is_interactive; then
+            # Non-interactive default: reconfigure (don't surprise CI by uninstalling).
+            ACTION=reconfigure
+        else
+            existing_install_menu
+        fi
+
+        case "$ACTION" in
+            uninstall)   uninstall_flow; exit 0 ;;
+            cancel)      say "  bye."; exit 0 ;;
+            reconfigure) seed_from_existing_config ;;
+        esac
+    fi
+
     wizard_role
     wizard_settings
     download_binary
