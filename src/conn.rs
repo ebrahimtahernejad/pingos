@@ -44,14 +44,7 @@ const GIVE_UP_AFTER: Duration = Duration::from_secs(45); // per-frame max retran
 
 // ---- public types ----------------------------------------------------------
 
-/// What the role of this side is in the conn-id ownership / dst routing.
-#[derive(Debug, Clone, Copy)]
-pub enum Side {
-    /// Client: known fixed peer IP, sends ICMP echo request.
-    Client,
-    /// Server: peer IP determined at handshake; sends ICMP echo reply.
-    Server,
-}
+pub use crate::proto::Side;
 
 /// Frame produced by a Conn for the central sender task to emit.
 #[derive(Debug)]
@@ -243,15 +236,25 @@ pub async fn drive(
     let (mut tcp_r, mut tcp_w) = tcp.split();
     let mut read_buf = vec![0u8; MAX_DATA_PAYLOAD];
 
+    // True once we've half-closed the local TCP write side in response to the
+    // peer sending FIN. This propagates the tunnel-level half-close to the
+    // local application (target on server side, listener client on client
+    // side), so an app like an HTTP server still gets to send its response
+    // after the client says "I'm done writing".
+    let mut tcp_w_shut = false;
+
     // Initial emit pass.
     emit_all(&mut send, &mut recv, &tx_frames, conn_id, dst, &cfg).await;
 
+    tracing::debug!(conn = %fmt_conn(conn_id), bootstrap = ?if matches!(bootstrap, Bootstrap::ClientSyn{..}) {"ClientSyn"} else {"ServerAccepted"}, "drive start");
     loop {
         // Termination conditions.
         if peer_rst {
+            tracing::debug!(conn = %fmt_conn(conn_id), "exit: peer_rst");
             break;
         }
         if closing && send.fin_acked && recv.peer_fin_consumed && recv.deliver_buf.is_empty() {
+            tracing::debug!(conn = %fmt_conn(conn_id), "exit: clean teardown");
             break;
         }
         if last_activity.elapsed() > cfg.idle_timeout {
@@ -303,6 +306,7 @@ pub async fn drive(
                     }
                     None => {
                         // demux dropped — tunnel down.
+                        tracing::debug!(conn = %fmt_conn(conn_id), "exit: rx_frames closed");
                         break;
                     }
                 }
@@ -388,11 +392,23 @@ pub async fn drive(
             }
         }
 
+        // Half-close propagation: once peer's FIN is consumed and we've
+        // flushed everything they sent us to the local TCP, signal EOF on
+        // our local write side. The local app (target / tester) can then
+        // finish what it's doing before fully closing.
+        if recv.peer_fin_consumed && !tcp_w_shut && recv.deliver_buf.is_empty() {
+            let _ = tcp_w.shutdown().await;
+            tcp_w_shut = true;
+            tracing::debug!(conn = %fmt_conn(conn_id), "local tcp write-half shut (peer FIN propagated)");
+        }
+
         // After any event, push everything that's emittable.
         emit_all(&mut send, &mut recv, &tx_frames, conn_id, dst, &cfg).await;
     }
 
-    let _ = tcp_w.shutdown().await;
+    if !tcp_w_shut {
+        let _ = tcp_w.shutdown().await;
+    }
     Ok(())
 }
 
@@ -419,7 +435,7 @@ fn handle_inbound(
     recv: &mut RecvState,
     established: &mut bool,
     peer_rst: &mut bool,
-    closing: &mut bool,
+    _closing: &mut bool,
 ) {
     let now = Instant::now();
 
@@ -480,18 +496,14 @@ fn handle_inbound(
         }
     }
 
-    // If we've consumed peer FIN, mark closing on the local side too so we
-    // stop reading from TCP.
-    if recv.peer_fin_consumed && !*closing {
-        *closing = true;
-        if send.fin_seq.is_none() {
-            send.fin_seq = Some(send.next_seq);
-            queue(send, Op::Fin, Bytes::new());
-        }
-    }
+    // NB: peer_fin_consumed alone does NOT trigger our own FIN. We propagate
+    // the half-close to the local TCP (shutdown(WR) on tcp_w) once deliver_buf
+    // is fully flushed — see the main loop. Our own FIN is queued only when
+    // local TCP read returns 0/Err, i.e. our app side is done sending.
 }
 
 fn deliver(op: Op, payload: Bytes, recv: &mut RecvState, established: &mut bool) {
+    tracing::trace!(?op, paylen = payload.len(), "deliver");
     match op {
         Op::Syn | Op::SynAck => {
             *established = true;

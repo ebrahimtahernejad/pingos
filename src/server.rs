@@ -19,13 +19,20 @@ use crate::icmp::{IcmpSocket, ICMP_ECHO_REPLY, ICMP_ECHO_REQUEST};
 use crate::proto::{FecConfig, Frame, Op, MAX_WIRE_SIZE};
 use crate::wire::Codec;
 
+/// Per-peer state for picking ICMP echo-reply id/seq.
+///
+/// Stateful ICMP NAT/firewalls (and Linux conntrack) generally require
+/// `reply.id == request.id && reply.seq == request.seq` to consider the
+/// reply legitimate. We mirror both fields of the most recent request we
+/// saw from this peer.
 struct PeerState {
     last_icmp_id: AtomicU16,
+    last_icmp_seq: AtomicU16,
 }
 
 pub async fn run(args: ServerArgs) -> Result<()> {
     let icmp_sock = IcmpSocket::bind(&args.bind)?;
-    let codec = Arc::new(Codec::new(&args.password, args.compression));
+    let codec = Arc::new(Codec::new(&args.password, args.compression, Side::Server));
     if codec.is_encrypted() {
         tracing::info!("encryption: ChaCha20-Poly1305 (password-derived)");
     } else {
@@ -58,14 +65,12 @@ pub async fn run(args: ServerArgs) -> Result<()> {
     let conns: Conns = Arc::new(Mutex::new(HashMap::new()));
 
     let (out_tx, mut out_rx) = mpsc::channel::<Outbound>(4096);
-    let icmp_seq = Arc::new(AtomicU16::new(0));
 
     // Sender task.
     {
         let icmp_sock = icmp_sock.clone_handle();
         let codec = Arc::clone(&codec);
         let peer_ids = Arc::clone(&peer_ids);
-        let icmp_seq = Arc::clone(&icmp_seq);
         let fec_cfg = fec_cfg;
         tokio::spawn(async move {
             let mut fec_enc = if fec_cfg.is_enabled() {
@@ -88,14 +93,20 @@ pub async fn run(args: ServerArgs) -> Result<()> {
                         continue;
                     }
                 };
-                let id = match peer_ids.lock().await.get(&out.dst) {
-                    Some(p) => p.last_icmp_id.load(Ordering::Relaxed),
-                    None => 0,
+                // Mirror the *latest* (id, seq) we've received from this peer.
+                // Stateful ICMP firewalls expect reply.id == request.id AND
+                // reply.seq == request.seq; minting a fresh seq here can make
+                // intermediate boxes drop the reply.
+                let (id, seq) = match peer_ids.lock().await.get(&out.dst) {
+                    Some(p) => (
+                        p.last_icmp_id.load(Ordering::Relaxed),
+                        p.last_icmp_seq.load(Ordering::Relaxed),
+                    ),
+                    None => (0, 0),
                 };
                 if let Some(enc) = fec_enc.as_mut() {
                     for shard in enc.submit(bytes) {
                         let wrapped = fec::wrap_shard(&shard, fec_cfg);
-                        let seq = icmp_seq.fetch_add(1, Ordering::Relaxed);
                         if let Err(e) = icmp_sock
                             .send(out.dst, ICMP_ECHO_REPLY, id, seq, &wrapped)
                             .await
@@ -104,7 +115,6 @@ pub async fn run(args: ServerArgs) -> Result<()> {
                         }
                     }
                 } else {
-                    let seq = icmp_seq.fetch_add(1, Ordering::Relaxed);
                     if let Err(e) = icmp_sock
                         .send(out.dst, ICMP_ECHO_REPLY, id, seq, &bytes)
                         .await
@@ -138,13 +148,18 @@ pub async fn run(args: ServerArgs) -> Result<()> {
         if pkt.icmp_type != ICMP_ECHO_REQUEST {
             continue;
         }
-        // Update peer's known icmp_id.
+        // Update peer's known (icmp_id, icmp_seq) so our replies look like
+        // legitimate responses to the latest request seen.
         {
             let mut map = peer_ids.lock().await;
             let entry = map.entry(pkt.src).or_insert_with(|| {
-                Arc::new(PeerState { last_icmp_id: AtomicU16::new(pkt.icmp_id) })
+                Arc::new(PeerState {
+                    last_icmp_id: AtomicU16::new(pkt.icmp_id),
+                    last_icmp_seq: AtomicU16::new(pkt.icmp_seq),
+                })
             });
             entry.last_icmp_id.store(pkt.icmp_id, Ordering::Relaxed);
+            entry.last_icmp_seq.store(pkt.icmp_seq, Ordering::Relaxed);
         }
 
         let parsed = match fec::parse_outer(&buf) {

@@ -1,6 +1,6 @@
 [package]
 name = "pingos"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 description = "TCP-over-ICMP tunnel (clean-room Rust rewrite of pingtunnel's TCP forward mode)"
 license = "MIT"

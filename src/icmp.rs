@@ -27,20 +27,30 @@ pub struct IcmpPacket {
     pub src: Ipv4Addr,
     pub icmp_type: u8,
     pub icmp_id: u16,
-    #[allow(dead_code)]
     pub icmp_seq: u16,
 }
 
 /// Owned async wrapper around an ICMP socket.
 ///
-/// We try `SOCK_DGRAM` + `IPPROTO_ICMP` first (works without root on macOS, and
-/// on Linux if `net.ipv4.ping_group_range` permits the calling gid). If that
-/// fails with EPERM/EACCES we fall back to `SOCK_RAW` + `IPPROTO_ICMP` (root /
-/// `cap_net_raw`). The two modes differ on recv: `SOCK_RAW` includes the IPv4
-/// header, `SOCK_DGRAM` does not.
+/// Selection order:
+///   - If we're effectively root (or have `cap_net_raw`), open `SOCK_RAW` +
+///     `IPPROTO_ICMP`. This is the only mode that can really *receive* echo
+///     requests on Linux — the kernel routes echo requests away from DGRAM
+///     ICMP sockets, so a DGRAM-vs-DGRAM tunnel doesn't actually work between
+///     two machines. RAW is also needed to send echo replies (type 0).
+///   - Otherwise try `SOCK_DGRAM` + `IPPROTO_ICMP` (works without privileges on
+///     macOS, and on Linux when `net.ipv4.ping_group_range` allows the gid).
+///     Useful for one-off ping-style usage and dev; not great for tunnels.
+///
+/// The two modes differ on recv: `SOCK_RAW` includes the IPv4 header in the
+/// buffer, `SOCK_DGRAM` does not.
 pub struct IcmpSocket {
     inner: Arc<AsyncFd<Socket>>,
     is_raw: bool,
+}
+
+fn am_root() -> bool {
+    unsafe { libc::geteuid() == 0 }
 }
 
 impl IcmpSocket {
@@ -49,17 +59,51 @@ impl IcmpSocket {
             .parse()
             .with_context(|| format!("invalid bind address: {}", bind_ip))?;
 
-        // First, try the unprivileged DGRAM ICMP socket.
-        let (sock, is_raw) = match Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::ICMPV4)) {
-            Ok(s) => {
-                tracing::debug!("using SOCK_DGRAM ICMP (unprivileged)");
-                (s, false)
+        // Decide RAW-vs-DGRAM up front based on privileges.
+        let prefer_raw = am_root();
+
+        let try_raw = || Socket::new(Domain::IPV4, Type::RAW, Some(Protocol::ICMPV4));
+        let try_dgram = || Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::ICMPV4));
+
+        let (sock, is_raw) = if prefer_raw {
+            match try_raw() {
+                Ok(s) => {
+                    tracing::debug!("using SOCK_RAW ICMP (root)");
+                    (s, true)
+                }
+                Err(e_raw) => match try_dgram() {
+                    Ok(s) => {
+                        tracing::warn!(error = %e_raw, "RAW ICMP unavailable, falling back to DGRAM (echo requests may not be received)");
+                        (s, false)
+                    }
+                    Err(e_dgram) => {
+                        return Err(anyhow::anyhow!(
+                            "failed to create ICMP socket — RAW: {} / DGRAM: {}",
+                            e_raw,
+                            e_dgram
+                        ));
+                    }
+                },
             }
-            Err(e_dgram) => {
-                tracing::debug!(error = %e_dgram, "DGRAM ICMP unavailable, falling back to RAW");
-                let s = Socket::new(Domain::IPV4, Type::RAW, Some(Protocol::ICMPV4))
-                    .context("failed to create ICMP socket (need root or cap_net_raw, and DGRAM ICMP unavailable)")?;
-                (s, true)
+        } else {
+            match try_dgram() {
+                Ok(s) => {
+                    tracing::debug!("using SOCK_DGRAM ICMP (unprivileged)");
+                    (s, false)
+                }
+                Err(e_dgram) => match try_raw() {
+                    Ok(s) => {
+                        tracing::debug!(error = %e_dgram, "DGRAM ICMP unavailable, falling back to RAW");
+                        (s, true)
+                    }
+                    Err(e_raw) => {
+                        return Err(anyhow::anyhow!(
+                            "failed to create ICMP socket — DGRAM: {} / RAW: {}",
+                            e_dgram,
+                            e_raw
+                        ));
+                    }
+                },
             }
         };
 

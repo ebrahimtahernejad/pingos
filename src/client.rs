@@ -44,7 +44,7 @@ pub async fn run(args: ClientArgs) -> Result<()> {
     tracing::info!(server = %server, ip = %server_ip, "resolved server");
 
     let icmp_sock = IcmpSocket::bind("0.0.0.0")?;
-    let codec = Arc::new(Codec::new(&args.password, args.compression));
+    let codec = Arc::new(Codec::new(&args.password, args.compression, Side::Client));
     if codec.is_encrypted() {
         tracing::info!("encryption: ChaCha20-Poly1305 (password-derived)");
     } else {

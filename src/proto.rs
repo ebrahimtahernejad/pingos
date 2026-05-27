@@ -44,6 +44,19 @@ pub const FEC_MAGIC: [u8; 4] = *b"PNG2";
 pub const VERSION: u8 = 2;
 
 pub const FLAG_ENCRYPTED: u8 = 0b0000_0001;
+/// Outer flag set by the server side. Lets the client drop the kernel-generated
+/// echo replies that happen when /proc/sys/net/ipv4/icmp_echo_ignore_all=0 —
+/// those bounce back the client's *own* bytes (same key, same magic) and
+/// without this bit they'd be misinterpreted as if the server sent them,
+/// corrupting the reliability state.
+pub const FLAG_FROM_SERVER: u8 = 0b0000_0010;
+
+/// Which side of the tunnel a codec / connection lives on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Side {
+    Client,
+    Server,
+}
 
 // Inner-frame `frame_flags` bits.
 pub const FF_COMPRESSED: u8 = 0b0000_0001;

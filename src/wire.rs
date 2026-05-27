@@ -5,8 +5,8 @@ use chacha20poly1305::{ChaCha20Poly1305, Key, Nonce};
 use rand::RngCore;
 
 use crate::proto::{
-    Compression, Frame, Op, COMPRESS_MIN, FF_COMPRESSED, FLAG_ENCRYPTED, MAGIC, MAX_DATA_PAYLOAD,
-    MAX_WIRE_SIZE, VERSION,
+    Compression, Frame, Op, Side, COMPRESS_MIN, FF_COMPRESSED, FLAG_ENCRYPTED, FLAG_FROM_SERVER,
+    MAGIC, MAX_DATA_PAYLOAD, MAX_WIRE_SIZE, VERSION,
 };
 
 const NONCE_LEN: usize = 12;
@@ -18,11 +18,14 @@ const INNER_HEADER_LEN: usize = 1 + 1 + 1 + 8 + 4 + 4 + 2 + 2;
 pub struct Codec {
     cipher: Option<ChaCha20Poly1305>,
     compression: Compression,
+    /// Side this codec runs on. Used to set the outgoing direction flag and
+    /// to reject self-echoed frames on decode.
+    side: Side,
 }
 
 impl Codec {
     /// Build a codec. Empty password = no encryption (frames flow in cleartext).
-    pub fn new(password: &str, compression: Compression) -> Self {
+    pub fn new(password: &str, compression: Compression, side: Side) -> Self {
         let cipher = if password.is_empty() {
             None
         } else {
@@ -32,7 +35,7 @@ impl Codec {
             let key = Key::from_slice(&key_bytes);
             Some(ChaCha20Poly1305::new(key))
         };
-        Codec { cipher, compression }
+        Codec { cipher, compression, side }
     }
 
     pub fn is_encrypted(&self) -> bool {
@@ -41,6 +44,15 @@ impl Codec {
 
     pub fn compression(&self) -> Compression {
         self.compression
+    }
+
+    /// True if a frame with the given outer `from_server` bit came from the
+    /// peer (the opposite side). Used to drop kernel-bounced self-echoes.
+    fn is_from_peer(&self, from_server: bool) -> bool {
+        match self.side {
+            Side::Client => from_server,    // client expects frames marked server
+            Side::Server => !from_server,   // server expects frames marked client
+        }
     }
 
     /// Encode a `Frame` into a single on-the-wire packet (ICMP echo payload).
@@ -76,9 +88,14 @@ impl Codec {
         let mut out = BytesMut::with_capacity(4 + 1 + NONCE_LEN + inner.len() + TAG_LEN);
         out.extend_from_slice(&MAGIC);
 
+        let mut outer_flags = 0u8;
+        if matches!(self.side, Side::Server) {
+            outer_flags |= FLAG_FROM_SERVER;
+        }
+
         match &self.cipher {
             None => {
-                out.put_u8(0);
+                out.put_u8(outer_flags);
                 out.extend_from_slice(&inner);
             }
             Some(cipher) => {
@@ -88,7 +105,8 @@ impl Codec {
                 let ciphertext = cipher
                     .encrypt(nonce, inner.as_ref())
                     .map_err(|_| anyhow!("encryption failed"))?;
-                out.put_u8(FLAG_ENCRYPTED);
+                outer_flags |= FLAG_ENCRYPTED;
+                out.put_u8(outer_flags);
                 out.extend_from_slice(&nonce_bytes);
                 out.extend_from_slice(&ciphertext);
             }
@@ -113,6 +131,13 @@ impl Codec {
         let flags = bytes[0];
         bytes = &bytes[1..];
         let encrypted = (flags & FLAG_ENCRYPTED) != 0;
+
+        // Direction filter: drop frames not from the peer (e.g. our own packets
+        // bounced back as kernel echo replies).
+        let from_server = (flags & FLAG_FROM_SERVER) != 0;
+        if !self.is_from_peer(from_server) {
+            bail!("self-echoed frame dropped (direction bit matches self)");
+        }
 
         let inner: Vec<u8> = if encrypted {
             let cipher = self
@@ -215,34 +240,47 @@ mod tests {
         }
     }
 
+    /// Convenience: build a (client, server) codec pair for round-trip tests.
+    fn pair(password: &str, compression: Compression) -> (Codec, Codec) {
+        (
+            Codec::new(password, compression, Side::Client),
+            Codec::new(password, compression, Side::Server),
+        )
+    }
+
     #[test]
     fn roundtrip_plaintext() {
-        let c = Codec::new("", Compression::None);
+        let (c, s) = pair("", Compression::None);
         let f = sample_frame(Op::Data, b"hello world");
+        // client → server
         let bytes = c.encode(&f).unwrap();
-        let g = c.decode(&bytes).unwrap();
+        let g = s.decode(&bytes).unwrap();
         assert_eq!(g.op, Op::Data);
         assert_eq!(g.conn_id, f.conn_id);
         assert_eq!(g.seq, f.seq);
         assert_eq!(g.ack, f.ack);
         assert_eq!(g.win, f.win);
         assert_eq!(g.payload, f.payload);
+        // server → client
+        let bytes2 = s.encode(&f).unwrap();
+        let g2 = c.decode(&bytes2).unwrap();
+        assert_eq!(g2.payload, f.payload);
     }
 
     #[test]
     fn roundtrip_encrypted() {
-        let c = Codec::new("hunter2", Compression::None);
+        let (c, s) = pair("hunter2", Compression::None);
         let f = sample_frame(Op::Syn, b"example.com:443");
         let bytes = c.encode(&f).unwrap();
-        let g = c.decode(&bytes).unwrap();
+        let g = s.decode(&bytes).unwrap();
         assert_eq!(g.op, Op::Syn);
         assert_eq!(g.payload, f.payload);
     }
 
     #[test]
     fn decrypt_wrong_key_fails() {
-        let a = Codec::new("alpha", Compression::None);
-        let b = Codec::new("beta", Compression::None);
+        let a = Codec::new("alpha", Compression::None, Side::Client);
+        let b = Codec::new("beta", Compression::None, Side::Server);
         let f = sample_frame(Op::Data, b"secret");
         let bytes = a.encode(&f).unwrap();
         assert!(b.decode(&bytes).is_err());
@@ -250,53 +288,60 @@ mod tests {
 
     #[test]
     fn plaintext_to_encrypted_fails() {
-        let p = Codec::new("", Compression::None);
-        let e = Codec::new("k", Compression::None);
+        let p = Codec::new("", Compression::None, Side::Client);
+        let e = Codec::new("k", Compression::None, Side::Server);
         let f = sample_frame(Op::Ping, &[]);
         let bytes = p.encode(&f).unwrap();
         assert!(e.decode(&bytes).is_err());
     }
 
     #[test]
+    fn self_echo_rejected() {
+        // Same codec on both ends: simulates a kernel-bounced echo reply where
+        // the client receives back its own bytes. Decode must reject.
+        let c = Codec::new("hunter2", Compression::None, Side::Client);
+        let f = sample_frame(Op::Data, b"my own packet");
+        let bytes = c.encode(&f).unwrap();
+        let err = c.decode(&bytes).unwrap_err().to_string();
+        assert!(err.contains("self-echoed"), "unexpected error: {err}");
+    }
+
+    #[test]
     fn roundtrip_lz4_large_payload() {
-        let c = Codec::new("", Compression::Lz4);
+        let (c, s) = pair("", Compression::Lz4);
         // Compressible payload (repeating pattern).
         let payload: Vec<u8> = (0..800).map(|i| (i % 7) as u8).collect();
         let f = sample_frame(Op::Data, &payload);
         let bytes = c.encode(&f).unwrap();
         // Should have shrunk significantly: encoded should be much smaller than 800 + header.
         assert!(bytes.len() < 400, "encoded {} bytes", bytes.len());
-        let g = c.decode(&bytes).unwrap();
+        let g = s.decode(&bytes).unwrap();
         assert_eq!(g.payload.as_ref(), payload.as_slice());
     }
 
     #[test]
     fn lz4_skips_short_payload() {
-        let c = Codec::new("", Compression::Lz4);
-        // Below COMPRESS_MIN — should not be compressed.
+        let (c, s) = pair("", Compression::Lz4);
         let f = sample_frame(Op::Data, b"short");
         let bytes = c.encode(&f).unwrap();
-        let g = c.decode(&bytes).unwrap();
+        let g = s.decode(&bytes).unwrap();
         assert_eq!(g.payload.as_ref(), b"short");
     }
 
     #[test]
     fn lz4_skips_incompressible_payload() {
-        let c = Codec::new("", Compression::Lz4);
-        // Random-ish bytes (poly hash) don't compress.
+        let (c, s) = pair("", Compression::Lz4);
         let payload: Vec<u8> = (0u32..1000).map(|i| (i.wrapping_mul(2654435761) >> 23) as u8).collect();
         let f = sample_frame(Op::Data, &payload);
         let bytes = c.encode(&f).unwrap();
-        let g = c.decode(&bytes).unwrap();
+        let g = s.decode(&bytes).unwrap();
         assert_eq!(g.payload.as_ref(), payload.as_slice());
     }
 
     #[test]
     fn one_side_compressed_other_side_unaware_still_decodes() {
-        // The flag travels on the wire, so a Codec with Compression::None can
-        // still decode frames that came in compressed.
-        let sender = Codec::new("", Compression::Lz4);
-        let receiver = Codec::new("", Compression::None);
+        let sender = Codec::new("", Compression::Lz4, Side::Client);
+        let receiver = Codec::new("", Compression::None, Side::Server);
         let payload: Vec<u8> = (0..800).map(|i| (i % 11) as u8).collect();
         let f = sample_frame(Op::Data, &payload);
         let bytes = sender.encode(&f).unwrap();

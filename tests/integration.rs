@@ -217,8 +217,8 @@ async fn run_pair_codec_fec(
     mut drop_s2c: impl FnMut(usize) -> bool + Send + 'static,
 ) -> Result<()> {
     // Two encoder/decoder pairs (one per direction).
-    let codec_c = Codec::new(password, compression);
-    let codec_s = Codec::new(password, compression);
+    let codec_c = Codec::new(password, compression, Side::Client);
+    let codec_s = Codec::new(password, compression, Side::Server);
 
     let (client_out_tx, mut client_out_rx) = mpsc::channel::<Outbound>(256);
     let (server_out_tx, mut server_out_rx) = mpsc::channel::<Outbound>(256);
