@@ -2,13 +2,20 @@
 #
 # pingos · install wizard
 #
+# Online (downloads the latest binary from GitHub releases):
+#
 #   curl -fsSL https://github.com/EbrahimTahernejad/pingos/releases/latest/download/install.sh | sudo bash
+#
+# Offline (use a local pingos binary; pass its path as the first arg):
+#
+#   sudo bash install.sh ./pingos-linux-x86_64
 #
 # What it does:
 #   - confirms you're on linux with systemd + root
 #   - lets you pick server or client
 #   - walks you through settings (password, fec, compression, ports)
-#   - downloads the right binary from the latest GitHub release
+#   - either downloads the binary from the latest GitHub release, OR
+#     copies the local binary you pass as $1 (offline install)
 #   - generates /etc/pingos/<role>.toml from your answers
 #   - drops a systemd unit at /etc/systemd/system/pingos.service
 #   - enables + starts the service
@@ -30,6 +37,9 @@
 set -euo pipefail
 
 REPO="EbrahimTahernejad/pingos"
+
+# Optional first positional arg: path to a local pingos binary for offline install.
+LOCAL_BIN="${1:-}"
 
 # ──────────────────────── style ────────────────────────────────────────────
 
@@ -210,8 +220,12 @@ system_check() {
     ARCH=$(detect_arch)
     ok "arch: $ARCH"
 
-    if ! command -v curl >/dev/null 2>&1; then die "missing 'curl'"; fi
-    ok "curl present"
+    if [[ -z "${LOCAL_BIN:-}" ]]; then
+        if ! command -v curl >/dev/null 2>&1; then die "missing 'curl' (or pass a local binary as the first arg)"; fi
+        ok "curl present"
+    else
+        ok "offline mode (will install $LOCAL_BIN)"
+    fi
 }
 
 # ───────────────────── role + settings wizard ─────────────────────────────
@@ -317,8 +331,40 @@ resolve_release_url() {
     fi
 }
 
+elf_check() {
+    # Check first 4 bytes are the ELF magic (0x7f 'E' 'L' 'F').
+    local f="$1" hex
+    hex=$(head -c4 "$f" 2>/dev/null | od -An -tx1 | tr -d ' \n')
+    [[ "$hex" == "7f454c46" ]]
+}
+
+install_local_binary() {
+    local src="$1"
+    info "offline install"
+    info "source: ${C_DIM}$src${C_RESET}"
+    [[ -f "$src" ]] || die "binary not found: $src"
+    [[ -s "$src" ]] || die "binary is empty: $src"
+    if ! elf_check "$src"; then
+        warn "file doesn't look like an ELF binary"
+        if ! confirm "install anyway?" "n"; then die "aborted"; fi
+    fi
+    if [[ "${PINGOS_DRY_RUN:-}" == 1 ]]; then
+        ok "(dry-run) would install $src → /usr/local/bin/pingos"
+        return 0
+    fi
+    install -m 0755 "$src" /usr/local/bin/pingos
+    ok "installed → /usr/local/bin/pingos (from $src)"
+    /usr/local/bin/pingos --version 2>/dev/null | sed 's/^/    /' || true
+}
+
 download_binary() {
     section "fetching binary"
+
+    if [[ -n "${LOCAL_BIN:-}" ]]; then
+        install_local_binary "$LOCAL_BIN"
+        return
+    fi
+
     local url tmp_bin
     url=$(resolve_release_url)
     info "url: ${C_DIM}$url${C_RESET}"
@@ -334,15 +380,13 @@ download_binary() {
         warn "either the release doesn't exist yet, or your network is wonky."
         say  "       try setting PINGOS_VERSION=vX.Y.Z, or push a Cargo.toml version bump to main"
         say  "       to trigger the release workflow."
+        say  "       or pass a local binary: ${C_BOLD}sudo bash install.sh /path/to/pingos${C_RESET}"
         rm -f "$tmp_bin"
         exit 1
     fi
     chmod +x "$tmp_bin"
-    if [[ ! -s "$tmp_bin" ]]; then die "downloaded binary is empty"; fi
-    # sanity: file is an ELF binary
-    if [[ "$(head -c4 "$tmp_bin" | od -c 2>/dev/null | head -1 | awk '{$1=""; print $0}')" != *"E"*"L"*"F"* ]]; then
-        warn "downloaded file doesn't look like an ELF binary; installing anyway"
-    fi
+    [[ -s "$tmp_bin" ]] || die "downloaded binary is empty"
+    elf_check "$tmp_bin" || warn "downloaded file doesn't look like an ELF binary; installing anyway"
     install -m 0755 "$tmp_bin" /usr/local/bin/pingos
     rm -f "$tmp_bin"
     ok "installed → /usr/local/bin/pingos"
