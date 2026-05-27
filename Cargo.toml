@@ -1,0 +1,37 @@
+[package]
+name = "pingos"
+version = "0.1.0"
+edition = "2021"
+description = "TCP-over-ICMP tunnel (clean-room Rust rewrite of pingtunnel's TCP forward mode)"
+license = "MIT"
+
+[lib]
+name = "pingos"
+path = "src/lib.rs"
+
+[[bin]]
+name = "pingos"
+path = "src/main.rs"
+
+[dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "net", "io-util", "macros", "time", "sync", "signal"] }
+socket2 = { version = "0.5", features = ["all"] }
+bytes = "1"
+clap = { version = "4", features = ["derive"] }
+chacha20poly1305 = "0.10"
+blake3 = "1"
+rand = "0.8"
+anyhow = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+libc = "0.2"
+lz4_flex = { version = "0.11", default-features = false, features = ["std"] }
+reed-solomon-erasure = "6"
+serde = { version = "1", features = ["derive"] }
+toml = "0.8"
+
+[profile.release]
+lto = true
+codegen-units = 1
+opt-level = 3
+strip = true

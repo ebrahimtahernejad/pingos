@@ -1,0 +1,11 @@
+# pingos server config — used by the docker smoke test.
+# Common (apply to both subcommands)
+verbose     = true
+password    = "smoke-test"
+compression = "lz4"
+fec         = "8:2"
+
+[server]
+bind              = "0.0.0.0"
+dial_timeout_ms   = 5000
+idle_timeout_secs = 60

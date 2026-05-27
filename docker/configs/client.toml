@@ -1,0 +1,12 @@
+# pingos client config — used by the docker smoke test.
+# Common
+verbose     = true
+password    = "smoke-test"
+compression = "lz4"
+fec         = "8:2"
+
+[client]
+listen            = "0.0.0.0:4455"
+server            = "pingos_server"
+target            = "pingos_target:9000"
+idle_timeout_secs = 60

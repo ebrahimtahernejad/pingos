@@ -1,0 +1,139 @@
+name: Release
+
+# Releases when Cargo.toml's version bumps on `main`.
+#
+# Flow:
+#   1. `detect` job parses the version out of Cargo.toml and checks if a
+#      `v$VERSION` tag already exists. If yes, the rest of the workflow is a
+#      no-op. If no, it sets an output that downstream jobs gate on.
+#   2. `build` matrix produces statically-linked Linux binaries for x86_64 and
+#      aarch64, uploads each as an artifact.
+#   3. `release` collects artifacts + install.sh, creates the git tag, and
+#      publishes a GitHub Release with everything attached.
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  detect:
+    name: Detect version bump
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.v.outputs.version }}
+      should_release: ${{ steps.v.outputs.should_release }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - id: v
+        name: Parse version + check existing tag
+        run: |
+          set -euo pipefail
+          VERSION=$(sed -nE 's/^version *= *"([^"]+)".*/\1/p' Cargo.toml | head -1)
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          if git rev-parse "v$VERSION" >/dev/null 2>&1; then
+            echo "v$VERSION already tagged — skipping release"
+            echo "should_release=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "v$VERSION is new — will release"
+            echo "should_release=true" >> "$GITHUB_OUTPUT"
+          fi
+
+  build:
+    name: Build (${{ matrix.target }})
+    needs: detect
+    if: needs.detect.outputs.should_release == 'true'
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-musl
+            runner: ubuntu-latest
+            arch: x86_64
+          - target: aarch64-unknown-linux-musl
+            runner: ubuntu-24.04-arm
+            arch: aarch64
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust + musl target
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Install musl tools
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-${{ matrix.target }}-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Build release binary
+        run: cargo build --release --target ${{ matrix.target }} --bin pingos
+
+      - name: Stage artifact
+        run: |
+          mkdir -p out
+          cp target/${{ matrix.target }}/release/pingos out/pingos-linux-${{ matrix.arch }}
+          chmod +x out/pingos-linux-${{ matrix.arch }}
+          ( cd out && sha256sum pingos-linux-${{ matrix.arch }} > pingos-linux-${{ matrix.arch }}.sha256 )
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: pingos-linux-${{ matrix.arch }}
+          path: out/*
+
+  release:
+    name: Publish release
+    needs: [detect, build]
+    if: needs.detect.outputs.should_release == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Stage install.sh alongside binaries
+        run: cp install.sh dist/install.sh
+
+      - name: List artifacts
+        run: ls -la dist/
+
+      - name: Create tag + release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          VERSION: ${{ needs.detect.outputs.version }}
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git tag -a "v$VERSION" -m "Release v$VERSION"
+          git push origin "v$VERSION"
+          gh release create "v$VERSION" \
+            --title "v$VERSION" \
+            --notes "Automated release for pingos v$VERSION.
+
+\`\`\`bash
+curl -fsSL https://github.com/${{ github.repository }}/releases/latest/download/install.sh | sudo bash
+\`\`\`" \
+            dist/*

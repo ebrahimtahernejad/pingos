@@ -1,0 +1,15 @@
+# Reference Go project (kept out of the Rust repo).
+/pingtunnel/
+
+# Rust build output.
+/target/
+
+# IDE / editor.
+.idea/
+.vscode/
+*.swp
+.DS_Store
+
+# Local config secrets (don't commit /etc-style configs).
+/local.toml
+/pingos.toml

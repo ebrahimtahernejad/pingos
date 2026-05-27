@@ -1,0 +1,76 @@
+# Three-container smoke test on Linux:
+#
+#   [host:4455] --TCP--> [client] --ICMP--> [server] --TCP--> [target:9000]
+#
+# `target` is a tiny Python TCP echo server.
+# `server` and `client` run our pingos binary.
+# Both pingos containers need NET_RAW so the SOCK_RAW fallback works inside
+# Docker (the default `net.ipv4.ping_group_range` is "1 0" — i.e. nobody —
+# so SOCK_DGRAM ICMP is disabled and we fall back to RAW).
+
+services:
+  target:
+    image: python:3-slim
+    container_name: pingos_target
+    command:
+      - python3
+      - -u
+      - -c
+      - |
+        import socket, threading
+        s = socket.socket()
+        s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        s.bind(("0.0.0.0", 9000))
+        s.listen()
+        print("echo listening on 9000", flush=True)
+        def handle(c):
+            try:
+                while True:
+                    d = c.recv(65536)
+                    if not d:
+                        break
+                    c.sendall(d)
+            finally:
+                c.close()
+        while True:
+            c, addr = s.accept()
+            print(f"accepted {addr}", flush=True)
+            threading.Thread(target=handle, args=(c,), daemon=True).start()
+    networks:
+      - tunnel
+
+  server:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    image: pingos:local
+    container_name: pingos_server
+    # Drives the binary entirely off a TOML config (with -v from the file).
+    command: ["server", "--config", "/etc/pingos/server.toml"]
+    volumes:
+      - ./configs/server.toml:/etc/pingos/server.toml:ro
+    cap_add:
+      - NET_RAW
+    depends_on:
+      - target
+    networks:
+      - tunnel
+
+  client:
+    image: pingos:local
+    container_name: pingos_client
+    command: ["client", "--config", "/etc/pingos/client.toml"]
+    volumes:
+      - ./configs/client.toml:/etc/pingos/client.toml:ro
+    cap_add:
+      - NET_RAW
+    depends_on:
+      - server
+    ports:
+      - "4455:4455"
+    networks:
+      - tunnel
+
+networks:
+  tunnel:
+    driver: bridge
